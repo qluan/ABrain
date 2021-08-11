@@ -1,0 +1,71 @@
+#### 崩溃问题描述
+app是多进程，在Android 9上设置`WebView.setDataDirectorySuffix(processName);`之后，依然会出现下面的错误，每天100次左右。
+
+`：Using WebView from more than one process at once with the same data directory is not supported`
+
+#### WebView的上述机制源码解析：
+源码：https://chromium.googlesource.com/chromium/src/+/refs/heads/main/android_webview/java/src/org/chromium/android_webview/AwDataDirLock.java#41
+
+从Android 9开始，WebView的文件目录强行分离，每个进程的webview独享一个文件目录。
+从对比可以看到具体的目录大概是
+设置suffix之前目录是：/data/app/com.douban.frodo/files/app_webview
+设置suffix之后目录是：/data/app/com.douban.frodo/files/app_webview_%suffix%
+
+确保目录独占的方式是，初始化webview时，会在当前目录创建一个锁文件（如果已经有了则不创建），同时获取文件锁，获取成功之后，把当前进程写进去锁文件，webview初始化成功。
+当一个进程已经获取了文件锁，其他进程尝试获取的时候，如果已经有了文件锁，就会抛出上面的错误。
+
+#### 我们遇到问题是：我们崩溃的进程是主进程，提示占有锁文件的进程也是主进程，只是主进程的进程id不一样。
+大胆猜测：当app某次进程退出时，没有正确的解锁，那么就会出现上面的问题。
+
+#### 解决方式
+进程启动的时候，主动找到锁文件，并删除文件。成功解决
+
+/**
+     * 删除webview data dir lock file
+     * 参考源代码：https://chromium.googlesource.com/chromium/src/+/refs/heads/main/android_webview/java/src/org/chromium/android_webview/AwDataDirLock.java#41
+     * bugly错误id：https://bugly.qq.com/v2/crash-reporting/crashes/d40568d833/3403861/report?pid=1&bundleId=&channelId=&version=all&tagList=&start=0&date=last_7_day&search=Current%20process
+     * 分析：
+     * 主进程启动时，webview试图去lock特定目录，但该目录已经被lock。
+     * 根据bugly上错误和源代码分析，被lock的原因是上次未正常退出。
+     *
+     * 解决方式：
+     * 每次主动删除lock文件
+     */
+    public static void removeWebViewLockFile(Context context, String dataDirectorySuffix) {
+        if (null == context) {
+            return;
+        }
+        // 找到webview data dir, 格式类似于app_*webview_%suffix%
+        File dir = context.getFilesDir();
+        if (null == dir) {
+            return;
+        }
+        dir = dir.getParentFile();
+        if (null == dir) {
+            return;
+        }
+        String[] filenames = dir.list();
+        List<String> webViewDataFileNames = new ArrayList<>();
+        if (null != filenames && filenames.length > 0) {
+            for (String filename : filenames) {
+                Log.i("webview", "filename : " + filename);
+                if (filename.contains("webview") && filename.contains(dataDirectorySuffix)) {
+                    webViewDataFileNames.add(filename);
+                }
+            }
+        }
+        // 如果有对应的lock文件, 删除
+        for (String webViewDataFileName : webViewDataFileNames) {
+            if (!TextUtils.isEmpty(webViewDataFileName)) {
+                File lockFile = new File(dir+"/"+webViewDataFileName, "webview_data.lock");
+                Log.i("webview", "lock file : " + lockFile.getAbsolutePath());
+                if (lockFile.exists()) {
+                    boolean result =  lockFile.delete();
+                    Log.i("webview", "delete result : " + result);
+                }
+            }
+        }
+    }
+
+
+
